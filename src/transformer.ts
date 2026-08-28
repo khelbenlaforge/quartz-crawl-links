@@ -49,20 +49,31 @@ const isAbsoluteUrlWithOptions = isAbsoluteUrl as (
   options?: { httpOnly?: boolean },
 ) => boolean
 
-// CONFIRMED BUG (2026-08-28) in the real @quartz-community/utils transformLink(), fork of
-// this plugin: @quartz-community/utils is installed via an unpinned git ref, so different
-// consumers' separate npm installs can resolve different actual commits under the identical
-// declared "0.1.0" version. transformInternalLink() in THIS plugin's resolved copy lowercases
-// its input (confirmed: transformInternalLink("Sune") -> "./sune"), while real content slugs
-// (ctx.allSlugs, computed by core Quartz from a DIFFERENT resolved copy) preserve case
-// ("Sune", not "sune"). The upstream "shortest" strategy does an exact-match filter
-// (`targetCanonical === fileName`) between these two values - which can never succeed once one
-// side is silently lowercased and the other isn't, so EVERY wikilink with any uppercase letter
-// (i.e. essentially every wikilink in a normally-titled vault) falls through to the naive
-// site-root-relative fallback instead of the real resolved path. This is the actual upstream
-// transformLink() reimplemented here verbatim, with ONE change: the shortest-strategy match is
-// case-insensitive, which is robust regardless of which side (or neither, or both) is lowercased
-// by whatever commit each separate npm install happens to resolve.
+// CONFIRMED BUG (2026-08-28, updated 2026-08-28) in the real @quartz-community/utils
+// transformLink(), fork of this plugin: @quartz-community/utils is installed via an unpinned
+// git ref, so different consumers' separate npm installs can resolve different actual commits
+// under the identical declared "0.1.0" version. transformInternalLink() in THIS plugin's
+// resolved copy lowercases its input via slugifyFilePath()->_sluggify()->slugifyPath()'s
+// explicit .toLowerCase() (confirmed: transformInternalLink("Sune") -> "./sune"), while real
+// content slugs (ctx.allSlugs, computed by core Quartz from a DIFFERENT resolved copy) preserve
+// case ("Sune", not "sune"). transformInternalLink() runs unconditionally at the top of
+// transformLink() for EVERY link, not just ones that hit the "shortest" branch, so its lowercased
+// output can leak into the final resolved path via TWO separate routes: (1) the "shortest"
+// strategy's exact-match filter against fileName/slug, and (2) the plain fallback return
+// (`joinSegments(pathToRoot(src), canonicalSlug)`) used whenever "shortest" doesn't find a
+// unique match — including every multi-segment/folder-path target (e.g. `[[Characters/NPCs/]]`),
+// which the FIRST version of this fix (2026-08-28) didn't even attempt to match via "shortest"
+// at all, since it only implemented upstream's simple bare-filename comparison and omitted
+// upstream's own isMultiSegment/isFolderTarget matching (see real transformLink() source,
+// @quartz-community/utils dist/path.js) — so those links fell straight to the lowercased
+// fallback. Route (1) was fixed by the first pass (case-insensitive bare-filename comparison);
+// this pass fixes route (2) too, by porting upstream's full matching logic (multi-segment and
+// folder-index-page matching, both against `allSlugs`, which DOES include folder index pages
+// like "Characters/NPCs/index" and "Characters/PCs/The-Door-Kickers/index") — all comparisons
+// case-insensitive, and every successful match returns a slug pulled from `opts.allSlugs` itself
+// (correctly cased), never the lowercased `canonicalSlug`. Only a genuinely unmatched target
+// (a broken/nonexistent link) still falls through to the raw, possibly-lowercased fallback —
+// matching upstream's own graceful-degradation behavior for unresolvable links.
 function fixedTransformLink(
   src: FullSlug,
   target: RelativeURL,
@@ -72,22 +83,42 @@ function fixedTransformLink(
   if (opts.strategy === "relative") {
     return targetSlug
   } else {
+    const effectiveSrc =
+      !src.endsWith("index") && opts.allSlugs.includes(`${src}/index` as FullSlug)
+        ? (`${src}/index` as FullSlug)
+        : src
     const folderTail = isFolderPath(targetSlug) ? "/" : ""
     const canonicalSlug = stripSlashes(targetSlug.slice(".".length))
     const [targetCanonical, targetAnchor] = splitAnchor(canonicalSlug)
     if (opts.strategy === "shortest") {
       const targetCanonicalLower = targetCanonical.toLowerCase()
+      const isMultiSegment = targetCanonical.includes("/")
+      const isFolderTarget = isFolderPath(targetSlug)
       const matchingFileNames = opts.allSlugs.filter((slug) => {
+        const slugLower = slug.toLowerCase()
+        if (isMultiSegment) {
+          if (
+            slugLower === targetCanonicalLower ||
+            slugLower.endsWith("/" + targetCanonicalLower)
+          ) {
+            return true
+          }
+          if (isFolderTarget) {
+            const withIndexLower = targetCanonicalLower + "/index"
+            return slugLower === withIndexLower || slugLower.endsWith("/" + withIndexLower)
+          }
+          return false
+        }
         const parts = slug.split("/")
-        const fileName = parts.at(-1)
-        return targetCanonicalLower === (fileName ?? "").toLowerCase()
+        const fileName = (parts.at(-1) ?? "").toLowerCase()
+        return targetCanonicalLower === fileName
       })
       if (matchingFileNames.length === 1) {
         const matchedSlug = matchingFileNames[0] as FullSlug
-        return (resolveRelative(src, matchedSlug) + targetAnchor) as RelativeURL
+        return (resolveRelative(effectiveSrc, matchedSlug) + targetAnchor) as RelativeURL
       }
     }
-    return (joinSegments(pathToRoot(src), canonicalSlug) + folderTail) as RelativeURL
+    return (joinSegments(pathToRoot(effectiveSrc), canonicalSlug) + folderTail) as RelativeURL
   }
 }
 
