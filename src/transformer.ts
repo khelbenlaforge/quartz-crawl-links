@@ -4,17 +4,91 @@ import {
   stripSlashes,
   simplifySlug,
   splitAnchor,
-  transformInternalLink,
   isFolderPath,
   resolveRelative,
   joinSegments,
   pathToRoot,
+  getFileExtension,
+  endsWith,
 } from "@quartz-community/utils"
 import path from "path"
 import { visit } from "unist-util-visit"
 import isAbsoluteUrl from "is-absolute-url"
 import type { Root, Element, Text } from "hast"
 import type { VFile } from "vfile"
+
+// Case-safe reimplementation of slugifyPath()/slugifyFilePath()/transformInternalLink()
+// from @quartz-community/utils, identical to the real logic EXCEPT slugifyPath's
+// unconditional `.toLowerCase()` is omitted — that call is the actual root cause of the
+// version-drift bug (see the long comment on fixedTransformLink below). ctx.allSlugs (used
+// by the "shortest" strategy below) only ever contains REAL file slugs — confirmed in core
+// quartz/build.ts, where it's computed as `allFiles.map(slugifyFilePath)` before any
+// emitter runs — so it never includes virtual folder/tag index pages (e.g.
+// "Characters/NPCs/index"). That means matching against allSlugs can never recover the
+// correct case for a folder-style target like [[Characters/NPCs/]]; the only reliable fix
+// is to never let the drifted lowercasing happen in the first place. All the other pieces
+// used below (stripSlashes, getFileExtension, endsWith, isFolderPath, joinSegments,
+// splitAnchor, simplifySlug) are pure structural string operations with no case-sensitivity
+// of their own — safe to use regardless of which drifted commit this install resolved.
+function caseSafeSlugifyPath(s: string): string {
+  return s
+    .split("/")
+    .map((segment) =>
+      segment
+        .replace(/\s/g, "-")
+        .replace(/&/g, "-and-")
+        .replace(/%/g, "-percent")
+        .replace(/\?/g, "")
+        .replace(/#/g, "")
+        .replace(/[<>:"|*]/g, ""),
+    )
+    .join("/")
+    .replace(/\/$/, "")
+}
+
+function caseSafeSlugifyFilePath(fp: string): string {
+  fp = stripSlashes(fp as RelativeURL)
+  const ext = getFileExtension(fp)
+  const withoutFileExt = ext ? fp.slice(0, -ext.length) : fp
+  const finalExt = [".md", ".html", undefined].includes(ext) ? "" : ext
+  let slug = caseSafeSlugifyPath(withoutFileExt)
+  if (endsWith(slug as RelativeURL, "_index")) {
+    slug = slug.replace(/_index$/, "index")
+  }
+  const segments = slug.split("/")
+  if (segments.length >= 2 && segments[segments.length - 1] === segments[segments.length - 2]) {
+    segments[segments.length - 1] = "index"
+    slug = segments.join("/")
+  }
+  return slug + (finalExt ?? "")
+}
+
+function isRelativeSegment(s: string): boolean {
+  return /^\.{0,2}$/.test(s)
+}
+
+function addRelativeToStart(s: string): string {
+  if (s === "") return "."
+  if (!s.startsWith(".")) return joinSegments(".", s)
+  return s
+}
+
+function caseSafeTransformInternalLink(link: string): RelativeURL {
+  const [fplike, anchorRaw] = splitAnchor(decodeURI(link))
+  const anchor = anchorRaw ?? ""
+  const segments = fplike.split("/").filter((x) => x.length > 0)
+  const prefix = segments.filter(isRelativeSegment).join("/")
+  const fp = segments.filter((seg) => !isRelativeSegment(seg) && seg !== "").join("/")
+  const slugged = caseSafeSlugifyFilePath(fp)
+  const simpleSlug = simplifySlug(slugged as FullSlug)
+  const folderPath = isFolderPath(fplike as RelativeURL) || isFolderPath(slugged as RelativeURL)
+  const joined = joinSegments(
+    stripSlashes(prefix as RelativeURL),
+    stripSlashes(simpleSlug as unknown as RelativeURL),
+  )
+  const trail = folderPath ? "/" : ""
+  return (addRelativeToStart(joined) + trail + anchor) as RelativeURL
+}
 
 export interface CrawlLinksOptions {
   /** How to resolve Markdown paths */
@@ -49,37 +123,37 @@ const isAbsoluteUrlWithOptions = isAbsoluteUrl as (
   options?: { httpOnly?: boolean },
 ) => boolean
 
-// CONFIRMED BUG (2026-08-28, updated 2026-08-28) in the real @quartz-community/utils
-// transformLink(), fork of this plugin: @quartz-community/utils is installed via an unpinned
-// git ref, so different consumers' separate npm installs can resolve different actual commits
-// under the identical declared "0.1.0" version. transformInternalLink() in THIS plugin's
+// CONFIRMED BUG (2026-08-28, final fix) in the real @quartz-community/utils transformLink(),
+// fork of this plugin: @quartz-community/utils is installed via an unpinned git ref, so
+// different consumers' separate npm installs can resolve different actual commits under the
+// identical declared "0.1.0" version. The real transformInternalLink() in THIS plugin's
 // resolved copy lowercases its input via slugifyFilePath()->_sluggify()->slugifyPath()'s
-// explicit .toLowerCase() (confirmed: transformInternalLink("Sune") -> "./sune"), while real
-// content slugs (ctx.allSlugs, computed by core Quartz from a DIFFERENT resolved copy) preserve
-// case ("Sune", not "sune"). transformInternalLink() runs unconditionally at the top of
-// transformLink() for EVERY link, not just ones that hit the "shortest" branch, so its lowercased
-// output can leak into the final resolved path via TWO separate routes: (1) the "shortest"
-// strategy's exact-match filter against fileName/slug, and (2) the plain fallback return
-// (`joinSegments(pathToRoot(src), canonicalSlug)`) used whenever "shortest" doesn't find a
-// unique match — including every multi-segment/folder-path target (e.g. `[[Characters/NPCs/]]`),
-// which the FIRST version of this fix (2026-08-28) didn't even attempt to match via "shortest"
-// at all, since it only implemented upstream's simple bare-filename comparison and omitted
-// upstream's own isMultiSegment/isFolderTarget matching (see real transformLink() source,
-// @quartz-community/utils dist/path.js) — so those links fell straight to the lowercased
-// fallback. Route (1) was fixed by the first pass (case-insensitive bare-filename comparison);
-// this pass fixes route (2) too, by porting upstream's full matching logic (multi-segment and
-// folder-index-page matching, both against `allSlugs`, which DOES include folder index pages
-// like "Characters/NPCs/index" and "Characters/PCs/The-Door-Kickers/index") — all comparisons
-// case-insensitive, and every successful match returns a slug pulled from `opts.allSlugs` itself
-// (correctly cased), never the lowercased `canonicalSlug`. Only a genuinely unmatched target
-// (a broken/nonexistent link) still falls through to the raw, possibly-lowercased fallback —
-// matching upstream's own graceful-degradation behavior for unresolvable links.
+// unconditional `.toLowerCase()` (confirmed: transformInternalLink("Sune") -> "./sune"), while
+// real content slugs (ctx.allSlugs, computed by core Quartz from a DIFFERENT resolved copy)
+// preserve case ("Sune", not "sune").
+//
+// Two earlier attempts at this fix (both 2026-08-28) tried to recover the correct case AFTER
+// the fact, by matching the lowercased result against `opts.allSlugs`. Both were incomplete:
+// attempt 1 only handled bare-filename "shortest" targets; attempt 2 added multi-segment/
+// folder-index matching, but still failed for every folder-path target (e.g.
+// `[[Characters/NPCs/]]`, confirmed broken live on the site's own homepage) — because
+// `ctx.allSlugs` (confirmed in core quartz/build.ts: `allFiles.map(slugifyFilePath)`, computed
+// before any emitter runs) never contains virtual folder/tag index page slugs, so there is
+// nothing in it to match a folder target against.
+//
+// The only reliable fix is to never let the drifted lowercasing happen at all: this file locally
+// reimplements slugifyPath()/slugifyFilePath()/transformInternalLink() (as
+// caseSafeSlugifyPath/caseSafeSlugifyFilePath/caseSafeTransformInternalLink above), identical to
+// the real logic except omitting slugifyPath's `.toLowerCase()` call — the actual root cause.
+// Every other piece those helpers use (stripSlashes, getFileExtension, endsWith, isFolderPath,
+// joinSegments, splitAnchor, simplifySlug) is a pure structural string operation with no
+// case-sensitivity of its own, so importing them from whichever drifted copy resolves is safe.
 function fixedTransformLink(
   src: FullSlug,
   target: RelativeURL,
   opts: TransformOptions,
 ): RelativeURL {
-  const targetSlug = transformInternalLink(target)
+  const targetSlug = caseSafeTransformInternalLink(target)
   if (opts.strategy === "relative") {
     return targetSlug
   } else {
