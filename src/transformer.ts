@@ -318,10 +318,42 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<CrawlLinksOptions>> = (
                   node.properties.loading = "lazy"
                 }
 
-                if (!isAbsoluteUrlWithOptions(node.properties.src, { httpOnly: false })) {
-                  let dest = node.properties.src as RelativeURL
-                  dest = node.properties.src = fixedTransformLink(fileSlug, dest, transformOptions)
-                  node.properties.src = dest
+                const rawSrc = node.properties.src
+                if (
+                  !isAbsoluteUrlWithOptions(rawSrc, { httpOnly: false }) &&
+                  !rawSrc.startsWith("//")
+                ) {
+                  // Split the RAW fragment off before resolution — fixedTransformLink's
+                  // internal splitAnchor() re-slugifies (and lowercases) any anchor it sees,
+                  // which is correct for a heading-link anchor on an href but wrong for a
+                  // case-sensitive SVG fragment id (`![[diagram.svg#LayerA]]`). Resolve only
+                  // the anchor-free path, then reattach the original anchor untouched.
+                  const hashIdx = rawSrc.indexOf("#")
+                  const rawPath = (
+                    hashIdx === -1 ? rawSrc : rawSrc.slice(0, hashIdx)
+                  ) as RelativeURL
+                  const rawFragment = hashIdx === -1 ? "" : rawSrc.slice(hashIdx)
+                  const resolvedPath = fixedTransformLink(fileSlug, rawPath, transformOptions)
+                  // Unlike page links (which must preserve case — see fixedTransformLink's
+                  // header comment), binary assets are unconditionally lowercased on copy by
+                  // core's assets.ts emitter, so this branch's case-preserving resolution can
+                  // mismatch the lowercased file actually on disk. `iframe` is excluded: its
+                  // src can legitimately be an internal content page (case-preserving slug),
+                  // not a copied asset, and there's no reliable way to tell those apart from
+                  // the resolved path alone (a page slug can itself contain a literal `.`,
+                  // e.g. a note titled "Guide.V2", defeating any extension-based check) — img/
+                  // video/audio embeds are always binary media in this codebase's actual
+                  // usage, never a page, so lowercasing only those is safe.
+                  // KNOWN LIMITATION: a hand-authored raw HTML `<iframe src="Case.PDF">`
+                  // embedding a local binary asset (not produced by OFM's own wikilink-embed
+                  // syntax, which renders PDF embeds as a transclusion blockquote, not an
+                  // iframe) would still 404 here, since iframe is unconditionally exempted.
+                  // Accepted: no such usage exists in this site's content today, and closing
+                  // it needs a real asset-vs-page manifest, not another string heuristic.
+                  const shouldLowercase = node.tagName !== "iframe"
+                  node.properties.src = ((
+                    shouldLowercase ? resolvedPath.toLowerCase() : resolvedPath
+                  ) + rawFragment) as RelativeURL
                 }
               }
             })
