@@ -74,7 +74,18 @@ function addRelativeToStart(s: string): string {
 }
 
 function caseSafeTransformInternalLink(link: string): RelativeURL {
-  const [fplike, anchorRaw] = splitAnchor(decodeURI(link))
+  // decodeURI throws URIError on a malformed percent-sequence (e.g. a literal, unescaped
+  // "%" in a filename like "100%_cotton.png") — inherited unguarded from upstream's own
+  // transformInternalLink(), which has the identical unguarded call. Uncaught here, that
+  // throw propagates out of a remark/rehype tree visitor and kills the whole build for
+  // every page, not just the one file with the bad name. Fall back to the raw link text.
+  let decoded: string
+  try {
+    decoded = decodeURI(link)
+  } catch {
+    decoded = link
+  }
+  const [fplike, anchorRaw] = splitAnchor(decoded)
   const anchor = anchorRaw ?? ""
   const segments = fplike.split("/").filter((x) => x.length > 0)
   const prefix = segments.filter(isRelativeSegment).join("/")
