@@ -350,6 +350,17 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<CrawlLinksOptions>> = (
                   // iframe) would still 404 here, since iframe is unconditionally exempted.
                   // Accepted: no such usage exists in this site's content today, and closing
                   // it needs a real asset-vs-page manifest, not another string heuristic.
+                  // SAME LIMITATION, WIDER SCOPE (found via adversarial review, 2026-09-22):
+                  // this fix only touches img/video/audio/iframe `src`. Two other spots use
+                  // the same case-preserving fixedTransformLink() and are equally exposed if
+                  // they ever target a local binary asset: the `<a href>` branch just above
+                  // (a markdown link straight to a local .pdf/.zip/etc, not a wikilink embed),
+                  // and any raw HTML `<source src>`/`srcset`/`poster` (not in the tagName list
+                  // at all, so not even case-preserved — silently untouched either way).
+                  // Accepted for the same reason as the iframe case: grepped the whole vault
+                  // for both patterns, zero reachable hits (all matches were either absolute
+                  // external URLs or inside a folder excluded from publishing) — real in the
+                  // abstract, unused in this site's actual content today.
                   const shouldLowercase = node.tagName !== "iframe"
                   node.properties.src = ((
                     shouldLowercase ? resolvedPath.toLowerCase() : resolvedPath
