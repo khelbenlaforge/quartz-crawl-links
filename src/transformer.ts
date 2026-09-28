@@ -55,11 +55,6 @@ function caseSafeSlugifyFilePath(fp: string): string {
   if (endsWith(slug as RelativeURL, "_index")) {
     slug = slug.replace(/_index$/, "index")
   }
-  const segments = slug.split("/")
-  if (segments.length >= 2 && segments[segments.length - 1] === segments[segments.length - 2]) {
-    segments[segments.length - 1] = "index"
-    slug = segments.join("/")
-  }
   return slug + (finalExt ?? "")
 }
 
@@ -162,7 +157,7 @@ const isAbsoluteUrlWithOptions = isAbsoluteUrl as (
 function fixedTransformLink(
   src: FullSlug,
   target: RelativeURL,
-  opts: TransformOptions,
+  opts: TransformOptions & { fileSlugs?: Set<string> },
 ): RelativeURL {
   const targetSlug = caseSafeTransformInternalLink(target)
   if (opts.strategy === "relative") {
@@ -179,7 +174,7 @@ function fixedTransformLink(
       const targetCanonicalLower = targetCanonical.toLowerCase()
       const isMultiSegment = targetCanonical.includes("/")
       const isFolderTarget = isFolderPath(targetSlug)
-      const matchingFileNames = opts.allSlugs.filter((slug) => {
+      let matchingFileNames = opts.allSlugs.filter((slug) => {
         const slugLower = slug.toLowerCase()
         if (isMultiSegment) {
           if (
@@ -198,6 +193,19 @@ function fixedTransformLink(
         const fileName = (parts.at(-1) ?? "").toLowerCase()
         return targetCanonicalLower === fileName
       })
+      // Vault-absolute path (e.g. [[Vault/Notes/Pantheon/Shar]]) whose leading folders aren't
+      // in the published tree: fall back to the basename, still only if it's unambiguous.
+      if (matchingFileNames.length === 0 && isMultiSegment && !isFolderTarget) {
+        const baseLower = targetCanonicalLower.split("/").at(-1)
+        matchingFileNames = opts.allSlugs.filter(
+          (slug) => slug.split("/").at(-1)?.toLowerCase() === baseLower,
+        )
+      }
+      if (matchingFileNames.length > 1 && opts.fileSlugs) {
+        // alias slugs share allSlugs with real notes; like Obsidian, a real note wins
+        const real = matchingFileNames.filter((slug) => opts.fileSlugs!.has(slug))
+        if (real.length === 1) matchingFileNames = real
+      }
       if (matchingFileNames.length === 1) {
         const matchedSlug = matchingFileNames[0] as FullSlug
         return (resolveRelative(effectiveSrc, matchedSlug) + targetAnchor) as RelativeURL
@@ -216,14 +224,16 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<CrawlLinksOptions>> = (
     htmlPlugins(ctx: BuildCtx) {
       return [
         () => {
+          const fileSlugs = new Set(ctx.allFiles.map((fp) => caseSafeSlugifyFilePath(fp)))
           return (tree: Root, file: VFile) => {
             const fileSlug = file.data.slug as FullSlug
             const curSlug = simplifySlug(fileSlug)
             const outgoing: Set<SimpleSlug> = new Set()
 
-            const transformOptions: TransformOptions = {
+            const transformOptions = {
               strategy: opts.markdownLinkResolution,
               allSlugs: ctx.allSlugs,
+              fileSlugs,
             }
 
             visit(tree, "element", (node: Element) => {
